@@ -1,0 +1,164 @@
+#include <Wire.h>
+#include <Adafruit_MPU6050.h>
+#include <MAX30105.h>
+#include <heartRate.h>
+#include <U8g2lib.h>
+
+// ---------- Pins ----------
+#define MPU_SDA 21
+#define MPU_SCL 19
+#define MAX_SDA 23
+#define MAX_SCL 22
+#define OLED_SDA 16
+#define OLED_SCL 14
+
+// ---------- Devices ----------
+Adafruit_MPU6050 mpu;
+MAX30105 particleSensor;
+U8G2_SSD1306_128X64_NONAME0_F_SW_I2C u8g2(U8G2_R0, OLED_SCL, OLED_SDA, U8X8_PIN_NONE);
+
+// ---------- Game state ----------
+int score = 0;
+float lastAngle = 0;
+float angleAccum = 0;            // degrees moved since last point
+const float DEG_PER_POINT = 90.0;
+const float NOISE_DEADBAND = 1.5; // ignore tiny jitters (degrees)
+
+// Anti-cheat: max 3 points per 1000 ms
+const int MAX_POINTS_PER_SEC = 3;
+unsigned long pointTimes[MAX_POINTS_PER_SEC] = {0};
+int pointIdx = 0;
+unsigned long cheatWarnUntil = 0;
+
+// ---------- Heart rate ----------
+const byte RATE_SIZE = 4;
+byte rates[RATE_SIZE];
+byte rateSpot = 0;
+long lastBeat = 0;
+int bpm = 0;
+bool fingerOn = false;
+
+// ---------- Timers ----------
+unsigned long lastMpuMs = 0;
+unsigned long lastDisplayMs = 0;
+
+float readAngle() {
+  sensors_event_t a, g, t;
+  mpu.getEvent(&a, &g, &t);
+  return atan2(a.acceleration.y, a.acceleration.z) * 180.0 / PI;
+}
+
+float angleDiff(float now, float prev) {
+  float d = now - prev;
+  while (d > 180) d -= 360;
+  while (d < -180) d += 360;
+  return d;
+}
+
+// Returns true if awarding a point now would exceed the limit
+bool isCheating(unsigned long now) {
+  int recent = 0;
+  for (int i = 0; i < MAX_POINTS_PER_SEC; i++) {
+    if (pointTimes[i] != 0 && now - pointTimes[i] < 1000) recent++;
+  }
+  return recent >= MAX_POINTS_PER_SEC;
+}
+
+void updateHeartRate() {
+  long ir = particleSensor.getIR();
+  fingerOn = ir > 50000;
+  if (!fingerOn) { bpm = 0; return; }
+
+  if (checkForBeat(ir)) {
+    long delta = millis() - lastBeat;
+    lastBeat = millis();
+    float perMin = 60.0 / (delta / 1000.0);
+    if (perMin > 20 && perMin < 255) {
+      rates[rateSpot++] = (byte)perMin;
+      rateSpot %= RATE_SIZE;
+      int sum = 0;
+      for (byte i = 0; i < RATE_SIZE; i++) sum += rates[i];
+      bpm = sum / RATE_SIZE;
+    }
+  }
+}
+
+void updateScore() {
+  unsigned long now = millis();
+  float angle = readAngle();
+  float d = angleDiff(angle, lastAngle);
+  lastAngle = angle;
+
+  if (fabs(d) < NOISE_DEADBAND) return;
+  angleAccum += fabs(d);
+
+  while (angleAccum >= DEG_PER_POINT) {
+    angleAccum -= DEG_PER_POINT;
+    if (isCheating(now)) {
+      cheatWarnUntil = now + 2000;   // show warning, no point awarded
+    } else {
+      score++;
+      pointTimes[pointIdx] = now;
+      pointIdx = (pointIdx + 1) % MAX_POINTS_PER_SEC;
+    }
+  }
+}
+
+void drawScreen() {
+  u8g2.clearBuffer();
+  if (millis() < cheatWarnUntil) {
+    u8g2.setFont(u8g2_font_ncenB10_tr);
+    u8g2.drawStr(10, 25, "DON'T CHEAT!");
+    u8g2.setFont(u8g2_font_6x12_tr);
+    u8g2.drawStr(10, 45, "Slow down");
+  } else {
+    u8g2.setFont(u8g2_font_ncenB10_tr);
+    u8g2.setCursor(0, 20);
+    u8g2.print("Score: ");
+    u8g2.print(score);
+    u8g2.setCursor(0, 45);
+    u8g2.print("HR: ");
+    if (fingerOn && bpm > 0) { u8g2.print(bpm); u8g2.print(" bpm"); }
+    else u8g2.print(fingerOn ? "..." : "no finger");
+  }
+  u8g2.sendBuffer();
+}
+
+void setup() {
+  Serial.begin(115200);
+
+  Wire.begin(MPU_SDA, MPU_SCL);
+  Wire1.begin(MAX_SDA, MAX_SCL);
+
+  if (!mpu.begin(0x68, &Wire)) {
+    Serial.println("MPU6050 not found");
+    while (1) delay(10);
+  }
+  mpu.setAccelerometerRange(MPU6050_RANGE_4_G);
+  mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
+
+  if (!particleSensor.begin(Wire1, I2C_SPEED_FAST)) {
+    Serial.println("MAX3010x not found");
+    while (1) delay(10);
+  }
+  particleSensor.setup(0x1F, 4, 2, 400, 411, 4096); // LED brightness, avg, mode, rate, pulse width, range
+  particleSensor.setPulseAmplitudeRed(0x0A);
+  particleSensor.setPulseAmplitudeGreen(0);
+
+  u8g2.begin();
+  lastAngle = readAngle();
+}
+
+void loop() {
+  updateHeartRate();                       // run as often as possible
+
+  unsigned long now = millis();
+  if (now - lastMpuMs >= 20) {             // 50 Hz motion sampling
+    lastMpuMs = now;
+    updateScore();
+  }
+  if (now - lastDisplayMs >= 1000) {       // screen refresh every second
+    lastDisplayMs = now;
+    drawScreen();
+  }
+}
